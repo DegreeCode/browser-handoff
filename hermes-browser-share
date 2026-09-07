@@ -1,0 +1,125 @@
+#!/bin/bash
+set -euo pipefail
+umask 077
+
+source /usr/local/lib/hermes-browser/common.sh
+
+STATE="/run/hermes-browser"
+PIDFILE="$STATE/quick-tunnel.pid"
+URLFILE="$STATE/quick-tunnel.url"
+LOGFILE="$STATE/quick-tunnel.log"
+PASSFILE="$STATE/vnc-password"
+
+exec 8>/run/hermes-browser-share.lock
+if ! flock -w 30 8; then
+  hb_log ERROR "action=share error=lock_timeout"
+  echo "Could not acquire handoff lock" >&2
+  exit 1
+fi
+
+docker inspect -f '{{.State.Running}}' hermes-browser 2>/dev/null \
+  | grep -qx true || {
+    hb_log ERROR "action=share error=browser_not_running"
+    echo "Hermes browser is not running" >&2
+    exit 1
+  }
+
+curl -fsS http://127.0.0.1:6080/vnc.html >/dev/null || {
+  hb_log ERROR "action=share error=novnc_not_ready"
+  echo "noVNC is not ready" >&2
+  exit 1
+}
+
+# 이미 살아 있는 handoff는 그대로 재사용.
+if [[ -f "$PIDFILE" && -f "$URLFILE" ]]; then
+  PID="$(cat "$PIDFILE" 2>/dev/null || true)"
+  URL="$(cat "$URLFILE" 2>/dev/null || true)"
+
+  if [[ "$PID" =~ ^[0-9]+$ ]] &&
+     kill -0 "$PID" 2>/dev/null &&
+     [[ "$URL" == https://*.trycloudflare.com ]]; then
+    hb_log INFO "action=share result=already_shared"
+
+    echo "Browser handoff already ready"
+    echo "URL: ${URL}/vnc.html?autoconnect=true&resize=scale"
+    echo "VNC password: $(cat "$PASSFILE")"
+    exit 0
+  fi
+
+  hb_log WARN "action=share stale_handoff=true cleanup=true"
+fi
+
+# stale state만 정리. 다른 cloudflared 프로세스는 건드리지 않음.
+if [[ -f "$PIDFILE" ]]; then
+  PID="$(cat "$PIDFILE" 2>/dev/null || true)"
+  if [[ "$PID" =~ ^[0-9]+$ ]] && kill -0 "$PID" 2>/dev/null; then
+    kill "$PID" 2>/dev/null || true
+  fi
+fi
+
+rm -f "$PIDFILE" "$URLFILE" "$LOGFILE"
+touch "$LOGFILE"
+chmod 600 "$LOGFILE"
+
+hb_log INFO "action=share phase=starting_tunnel"
+
+nohup cloudflared tunnel \
+  --no-autoupdate \
+  --url http://127.0.0.1:6080 \
+  >"$LOGFILE" 2>&1 8>&- &
+
+PID=$!
+printf '%s\n' "$PID" > "$PIDFILE"
+
+SUCCESS=0
+
+cleanup_on_exit() {
+  rc=$?
+
+  if [[ "$SUCCESS" -eq 0 ]]; then
+    hb_log ERROR "action=share result=failed exit_code=$rc cleanup=true"
+
+    if kill -0 "$PID" 2>/dev/null; then
+      kill "$PID" 2>/dev/null || true
+    fi
+
+    rm -f "$PIDFILE" "$URLFILE" "$LOGFILE"
+  fi
+}
+
+trap cleanup_on_exit EXIT
+
+URL=""
+
+for _ in {1..60}; do
+  URL="$(
+    grep -Eo 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$LOGFILE" \
+      | tail -n 1 || true
+  )"
+
+  if [[ -n "$URL" ]]; then
+    break
+  fi
+
+  if ! kill -0 "$PID" 2>/dev/null; then
+    echo "Quick Tunnel exited unexpectedly" >&2
+    cat "$LOGFILE" >&2
+    exit 1
+  fi
+
+  sleep 0.5
+done
+
+if [[ -z "$URL" ]]; then
+  echo "Timed out waiting for Quick Tunnel URL" >&2
+  exit 1
+fi
+
+printf '%s\n' "$URL" > "$URLFILE"
+
+SUCCESS=1
+hb_log INFO "action=share result=ready"
+
+echo "Browser handoff ready"
+echo "URL: ${URL}/vnc.html?autoconnect=true&resize=scale"
+echo "VNC password: $(cat "$PASSFILE")"

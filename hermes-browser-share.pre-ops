@@ -1,0 +1,73 @@
+#!/bin/bash
+set -euo pipefail
+
+STATE=/run/hermes-browser
+LOG="$STATE/quick-tunnel.log"
+PIDFILE="$STATE/quick-tunnel.pid"
+URLFILE="$STATE/quick-tunnel.url"
+
+docker inspect -f '{{.State.Running}}' hermes-browser 2>/dev/null \
+  | grep -qx true || {
+    echo "Hermes browser is not running" >&2
+    exit 1
+  }
+
+curl -fsS http://127.0.0.1:6080/vnc.html >/dev/null || {
+  echo "noVNC is not ready" >&2
+  exit 1
+}
+
+# 기존 Quick Tunnel이 있으면 종료
+if [[ -f "$PIDFILE" ]]; then
+  OLDPID="$(cat "$PIDFILE" 2>/dev/null || true)"
+  if [[ "$OLDPID" =~ ^[0-9]+$ ]] && kill -0 "$OLDPID" 2>/dev/null; then
+    kill "$OLDPID" 2>/dev/null || true
+    sleep 1
+  fi
+fi
+
+rm -f "$LOG" "$PIDFILE" "$URLFILE"
+touch "$LOG"
+chmod 600 "$LOG"
+
+nohup cloudflared tunnel \
+  --no-autoupdate \
+  --url http://127.0.0.1:6080 \
+  >"$LOG" 2>&1 &
+
+PID=$!
+echo "$PID" > "$PIDFILE"
+chmod 600 "$PIDFILE"
+
+URL=""
+for _ in {1..60}; do
+  URL="$(grep -Eo 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$LOG" \
+    | tail -n 1 || true)"
+
+  if [[ -n "$URL" ]]; then
+    break
+  fi
+
+  if ! kill -0 "$PID" 2>/dev/null; then
+    echo "Quick Tunnel exited unexpectedly:" >&2
+    cat "$LOG" >&2
+    exit 1
+  fi
+
+  sleep 0.5
+done
+
+if [[ -z "$URL" ]]; then
+  echo "Timed out waiting for Quick Tunnel URL" >&2
+  cat "$LOG" >&2
+  exit 1
+fi
+
+echo "$URL" > "$URLFILE"
+chmod 600 "$URLFILE"
+
+PASSWORD="$(cat "$STATE/vnc-password")"
+
+echo "Browser handoff ready"
+echo "URL: ${URL}/vnc.html?autoconnect=true&resize=scale"
+echo "VNC password: ${PASSWORD}"

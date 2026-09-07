@@ -1,0 +1,72 @@
+#!/bin/bash
+set -euo pipefail
+umask 077
+
+DIR="/etc/hermes-browser/proxies.d"
+
+valid_name() {
+  [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
+cmd="${1:-}"
+name="${2:-}"
+
+case "$cmd" in
+  add)
+    [[ -n "$name" ]] || {
+      echo "Usage: hermes-browser-proxy add NAME" >&2
+      exit 2
+    }
+
+    valid_name "$name" || {
+      echo "Invalid profile name" >&2
+      exit 2
+    }
+
+    read -rsp 'Proxy URL: ' proxy
+    echo
+
+    [[ "$proxy" =~ ^(http|https|socks4|socks5):// ]] || {
+      echo "Unsupported proxy URL" >&2
+      exit 2
+    }
+
+    printf '%s\n' "$proxy" > "$DIR/$name"
+    chmod 600 "$DIR/$name"
+
+    echo "Proxy profile '$name' saved"
+    ;;
+
+  list)
+    shopt -s nullglob
+    files=("$DIR"/*)
+
+    if ((${#files[@]} == 0)); then
+      echo "No proxy profiles"
+      exit 0
+    fi
+
+    for f in "${files[@]}"; do
+      basename "$f"
+    done
+    ;;
+
+  remove)
+    [[ -n "$name" ]] || {
+      echo "Usage: hermes-browser-proxy remove NAME" >&2
+      exit 2
+    }
+
+    valid_name "$name" || exit 2
+    rm -f "$DIR/$name"
+    echo "Proxy profile '$name' removed"
+    ;;
+
+  *)
+    echo "Usage:"
+    echo "  hermes-browser-proxy add NAME"
+    echo "  hermes-browser-proxy list"
+    echo "  hermes-browser-proxy remove NAME"
+    exit 2
+    ;;
+esac

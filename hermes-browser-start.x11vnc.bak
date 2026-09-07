@@ -1,0 +1,69 @@
+#!/bin/bash
+set -euo pipefail
+
+NAME="hermes-browser"
+IMAGE="hermes-browser:local"
+LANGUAGE="ko-KR"
+PROXY=""
+
+while (($#)); do
+  case "$1" in
+    --lang)
+      LANGUAGE="${2:?missing language}"
+      shift 2
+      ;;
+    --proxy)
+      PROXY="${2:?missing proxy}"
+      shift 2
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+docker rm -f "$NAME" >/dev/null 2>&1 || true
+
+install -d -m 700 /run/hermes-browser
+
+VNC_PASSWORD="$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')"
+printf '%s\n' "$VNC_PASSWORD" > /run/hermes-browser/vnc-password
+chmod 600 /run/hermes-browser/vnc-password
+
+ARGS=(
+  -d --rm
+  --name "$NAME"
+  --shm-size=1g
+  --cap-drop=ALL
+  --security-opt no-new-privileges:true
+  -e "VNC_PASSWORD=$VNC_PASSWORD"
+  -e "BROWSER_LANG=$LANGUAGE"
+  -e "BROWSER_WIDTH=1440"
+  -e "BROWSER_HEIGHT=900"
+  -p 127.0.0.1:9222:9223
+  -p 127.0.0.1:6080:6080
+)
+
+if [[ -n "$PROXY" ]]; then
+  ARGS+=(-e "BROWSER_PROXY=$PROXY")
+fi
+
+docker run "${ARGS[@]}" "$IMAGE" >/dev/null
+
+for _ in {1..30}; do
+  if curl -fsS http://127.0.0.1:9222/json/version >/dev/null 2>&1 &&
+     curl -fsS http://127.0.0.1:6080/vnc.html >/dev/null 2>&1; then
+    echo "Hermes browser ready"
+    echo "CDP:   http://127.0.0.1:9222"
+    echo "noVNC: http://127.0.0.1:6080/vnc.html"
+    echo "VNC password: /run/hermes-browser/vnc-password"
+    exit 0
+  fi
+  sleep 0.5
+done
+
+echo "Browser failed to become ready" >&2
+docker logs "$NAME" >&2 || true
+docker rm -f "$NAME" >/dev/null 2>&1 || true
+exit 1

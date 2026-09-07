@@ -1,0 +1,8 @@
+#!/bin/bash
+set -euo pipefail
+
+/usr/local/bin/hermes-browser-unshare >/dev/null 2>&1 || true
+docker rm -f hermes-browser >/dev/null 2>&1 || true
+rm -rf /run/hermes-browser
+
+echo "Hermes browser stopped"

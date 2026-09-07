@@ -1,0 +1,174 @@
+#!/bin/bash
+set -euo pipefail
+umask 077
+
+source /usr/local/lib/hermes-browser/common.sh
+
+NAME="hermes-browser"
+IMAGE="hermes-browser:local"
+STATE="/run/hermes-browser"
+
+LANGUAGE="ko-KR"
+PROXY=""
+PROXY_PROFILE=""
+PROXY_DIR="/etc/hermes-browser/proxies.d"
+
+while (($#)); do
+  case "$1" in
+    --lang)
+      LANGUAGE="${2:?missing language}"
+      shift 2
+      ;;
+    --proxy)
+      PROXY="${2:?missing proxy}"
+      shift 2
+      ;;
+    --proxy-profile)
+      PROXY_PROFILE="${2:?missing proxy profile}"
+      shift 2
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -n "$PROXY" && -n "$PROXY_PROFILE" ]]; then
+  echo "Use either --proxy or --proxy-profile, not both" >&2
+  exit 2
+fi
+
+if [[ -n "$PROXY_PROFILE" ]]; then
+  if [[ ! "$PROXY_PROFILE" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "Invalid proxy profile name" >&2
+    exit 2
+  fi
+
+  PROFILE_FILE="$PROXY_DIR/$PROXY_PROFILE"
+
+  if [[ ! -f "$PROFILE_FILE" ]]; then
+    echo "Proxy profile not found: $PROXY_PROFILE" >&2
+    exit 2
+  fi
+
+  IFS= read -r PROXY < "$PROFILE_FILE" || true
+
+  if [[ -z "$PROXY" ]]; then
+    echo "Proxy profile is empty: $PROXY_PROFILE" >&2
+    exit 2
+  fi
+fi
+
+# 동시에 두 요청이 브라우저를 시작하지 못하게 함.
+exec 9>/run/hermes-browser.lock
+if ! flock -w 30 9; then
+  hb_log ERROR "action=start error=lock_timeout"
+  echo "Could not acquire browser lifecycle lock" >&2
+  exit 1
+fi
+
+# 이미 정상 실행 중이면 세션을 파괴하지 않고 그대로 사용.
+if docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null | grep -qx true; then
+  if [[ -n "$PROXY_PROFILE" ]]; then
+    CURRENT_PROFILE=""
+    if [[ -f "$STATE/proxy-profile" ]]; then
+      IFS= read -r CURRENT_PROFILE < "$STATE/proxy-profile" || true
+    fi
+
+    if [[ "$CURRENT_PROFILE" != "$PROXY_PROFILE" ]]; then
+      hb_log WARN "action=start error=proxy_profile_mismatch requested=$PROXY_PROFILE"
+      echo "Browser is already running with a different proxy profile." >&2
+      echo "Stop the existing browser before switching proxy profiles." >&2
+      exit 1
+    fi
+  fi
+
+  if curl -fsS http://127.0.0.1:9222/json/version >/dev/null 2>&1 &&
+     curl -fsS http://127.0.0.1:6080/vnc.html >/dev/null 2>&1; then
+    hb_log INFO "action=start result=already_running"
+    echo "Hermes browser already running"
+    echo "CDP:   http://127.0.0.1:9222"
+    echo "noVNC: http://127.0.0.1:6080/vnc.html"
+    exit 0
+  fi
+
+  hb_log WARN "action=start stale_container=true cleanup=true"
+  docker rm -f "$NAME" >/dev/null 2>&1 || true
+fi
+
+install -d -m 700 "$STATE"
+printf '%s\n' "$PROXY_PROFILE" > "$STATE/proxy-profile"
+chmod 600 "$STATE/proxy-profile"
+
+VNC_PASSWORD="$(
+  python3 -c '
+import secrets, string
+chars = string.ascii_letters + string.digits
+print("".join(secrets.choice(chars) for _ in range(8)))
+'
+)"
+
+printf '%s\n' "$VNC_PASSWORD" > "$STATE/vnc-password"
+chmod 600 "$STATE/vnc-password"
+
+SUCCESS=0
+
+cleanup_on_exit() {
+  rc=$?
+
+  if [[ "$SUCCESS" -eq 0 ]]; then
+    hb_log ERROR "action=start result=failed exit_code=$rc cleanup=true"
+
+    docker rm -f "$NAME" >/dev/null 2>&1 || true
+    rm -rf "$STATE"
+  fi
+}
+
+trap cleanup_on_exit EXIT
+
+ARGS=(
+  -d --rm
+  --name "$NAME"
+  --shm-size=1g
+  --cap-drop=ALL
+  --security-opt no-new-privileges:true
+  -e "VNC_PASSWORD=$VNC_PASSWORD"
+  -e "BROWSER_LANG=$LANGUAGE"
+  -e "BROWSER_WIDTH=1440"
+  -e "BROWSER_HEIGHT=900"
+  -p 127.0.0.1:9222:9223
+  -p 127.0.0.1:6080:6080
+)
+
+if [[ -n "$PROXY" ]]; then
+  ARGS+=(-e "BROWSER_PROXY=$PROXY")
+  PROXY_LOG="enabled"
+else
+  PROXY_LOG="disabled"
+fi
+
+hb_log INFO "action=start phase=launch lang=$LANGUAGE proxy=$PROXY_LOG proxy_profile=${PROXY_PROFILE:-none}"
+
+docker run "${ARGS[@]}" "$IMAGE" >/dev/null
+
+for _ in {1..40}; do
+  if curl -fsS http://127.0.0.1:9222/json/version >/dev/null 2>&1 &&
+     curl -fsS http://127.0.0.1:6080/vnc.html >/dev/null 2>&1; then
+
+    SUCCESS=1
+    hb_log INFO "action=start result=ready lang=$LANGUAGE proxy=$PROXY_LOG proxy_profile=${PROXY_PROFILE:-none}"
+
+    echo "Hermes browser ready"
+    echo "CDP:   http://127.0.0.1:9222"
+    echo "noVNC: http://127.0.0.1:6080/vnc.html"
+    echo "VNC password: $STATE/vnc-password"
+    exit 0
+  fi
+
+  sleep 0.5
+done
+
+echo "Browser failed to become ready" >&2
+docker logs "$NAME" >&2 || true
+exit 1

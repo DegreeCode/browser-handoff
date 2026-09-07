@@ -1,0 +1,41 @@
+#!/bin/bash
+set -euo pipefail
+
+source /usr/local/lib/hermes-browser/common.sh
+
+STATE="/run/hermes-browser"
+PIDFILE="$STATE/quick-tunnel.pid"
+URLFILE="$STATE/quick-tunnel.url"
+LOGFILE="$STATE/quick-tunnel.log"
+
+exec 8>/run/hermes-browser-share.lock
+if ! flock -w 30 8; then
+  hb_log ERROR "action=unshare error=lock_timeout"
+  echo "Could not acquire handoff lock" >&2
+  exit 1
+fi
+
+if [[ -f "$PIDFILE" ]]; then
+  PID="$(cat "$PIDFILE" 2>/dev/null || true)"
+
+  if [[ "$PID" =~ ^[0-9]+$ ]] && kill -0 "$PID" 2>/dev/null; then
+    hb_log INFO "action=unshare phase=stopping_tunnel pid=$PID"
+    kill "$PID" 2>/dev/null || true
+
+    for _ in {1..30}; do
+      kill -0 "$PID" 2>/dev/null || break
+      sleep 0.1
+    done
+
+    if kill -0 "$PID" 2>/dev/null; then
+      kill -KILL "$PID" 2>/dev/null || true
+    fi
+  else
+    hb_log WARN "action=unshare stale_pidfile=true"
+  fi
+fi
+
+rm -f "$PIDFILE" "$URLFILE" "$LOGFILE"
+
+hb_log INFO "action=unshare result=closed"
+echo "Browser handoff closed"
